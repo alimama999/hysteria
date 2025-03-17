@@ -1,39 +1,30 @@
-FROM golang:1-alpine AS builder
+FROM golang:latest AS builder
 
-# GOPROXY is disabled by default, use:
-# docker build --build-arg GOPROXY="https://goproxy.io" ...
-# to enable GOPROXY.
-ARG GOPROXY=""
+# 设置工作目录
+WORKDIR /app
 
-ENV GOPROXY ${GOPROXY}
+# 下载 Hysteria 2 源码
+RUN git clone --depth=1 https://github.com/apernet/hysteria /app/hysteria2
 
-COPY . /go/src/github.com/apernet/hysteria
+# 构建 Hysteria 2
+WORKDIR /app/hysteria2
+RUN go build -o /app/hysteria2-server ./cmd/server
 
-WORKDIR /go/src/github.com/apernet/hysteria
+# 生产环境镜像
+FROM debian:latest
+WORKDIR /root/
+COPY --from=builder /app/hysteria2-server /usr/local/bin/hysteria2-server
 
-RUN set -ex \
-    && apk add git build-base bash python3 \
-    && python hyperbole.py build -r \
-    && mv ./build/hysteria-* /go/bin/hysteria
+# 生成 config.yaml
+RUN echo 'listen: :"$HYSTERIA_PORT"' > /root/config.yaml && \
+    echo 'protocol: "$HYSTERIA_PROTOCOL"' >> /root/config.yaml && \
+    echo 'auth:\n  type: password\n  password: "$HYSTERIA_PASSWORD"' >> /root/config.yaml && \
+    if [ "$HYSTERIA_GENERATE_CERT" = "true" ]; then \
+        echo 'cert: "/root/selfsigned-cert.pem"' >> /root/config.yaml && \
+        echo 'key: "/root/selfsigned-key.pem"' >> /root/config.yaml && \
+        openssl req -x509 -newkey rsa:4096 -keyout /root/selfsigned-key.pem -out /root/selfsigned-cert.pem -days 365 -nodes -subj "/CN=localhost"; \
+    fi && \
+    echo 'masquerade:\n  type: proxy\n  proxy:\n    url: "$HYSTERIA_MASQUERADE"' >> /root/config.yaml
 
-# multi-stage builds to create the final image
-FROM alpine AS dist
-
-# set up nsswitch.conf for Go's "netgo" implementation
-# - https://github.com/golang/go/blob/go1.9.1/src/net/conf.go#L194-L275
-# - docker run --rm debian:stretch grep '^hosts:' /etc/nsswitch.conf
-RUN if [ ! -e /etc/nsswitch.conf ]; then echo 'hosts: files dns' > /etc/nsswitch.conf; fi
-
-# bash is used for debugging, tzdata is used to add timezone information.
-# Install ca-certificates to ensure no CA certificate errors.
-#
-# Do not try to add the "--no-cache" option when there are multiple "apk"
-# commands, this will cause the build process to become very slow.
-RUN set -ex \
-    && apk upgrade \
-    && apk add bash tzdata ca-certificates \
-    && rm -rf /var/cache/apk/*
-
-COPY --from=builder /go/bin/hysteria /usr/local/bin/hysteria
-
-ENTRYPOINT ["hysteria"]
+# 启动 Hysteria 2 服务器
+CMD ["sh", "-c", "hysteria2-server -c /root/config.yaml"]
